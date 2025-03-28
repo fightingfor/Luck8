@@ -3,6 +3,8 @@ import 'package:intl/intl.dart';
 import '../models/prediction_record.dart';
 import '../services/kl8_predictor.dart';
 import '../services/database_service.dart';
+import '../services/api_service.dart';
+import '../services/data_initializer.dart';
 
 class PredictionPage extends StatefulWidget {
   const PredictionPage({super.key});
@@ -14,14 +16,57 @@ class PredictionPage extends StatefulWidget {
 class _PredictionPageState extends State<PredictionPage> {
   final KL8Predictor _predictor = KL8Predictor();
   final DatabaseService _databaseService = DatabaseService();
+  final ApiService _apiService = ApiService();
+  final DataInitializer _dataInitializer = DataInitializer();
   bool _isLoading = false;
   Map<String, List<PredictionRecord>> _groupedPredictions = {};
   List<String> _expandedDrawNumbers = [];
+  String? _latestDrawNumber;
+  List<int>? _latestDrawNumbers;
+  DateTime? _latestDrawDate;
 
   @override
   void initState() {
     super.initState();
+    _loadLatestDraw();
     _loadPredictions();
+    _checkAndUpdateDrawnNumbers();
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
+  Future<void> _checkAndUpdateDrawnNumbers() async {
+    try {
+      // 获取所有预测记录
+      final predictions = await _databaseService.getAllPredictions();
+
+      // 获取所有开奖记录
+      final draws = await _databaseService.getAllDraws();
+
+      // 创建开奖记录映射，方便查找
+      final drawsMap = {for (var draw in draws) draw.drawNumber: draw};
+
+      // 检查每个未开奖的预测
+      for (var prediction in predictions) {
+        if (!prediction.isDrawn &&
+            drawsMap.containsKey(prediction.drawNumber)) {
+          // 找到对应的开奖记录，更新预测记录
+          final draw = drawsMap[prediction.drawNumber]!;
+          await _databaseService.updateDrawnPredictions(
+            prediction.drawNumber,
+            draw.numbers,
+          );
+        }
+      }
+
+      // 重新加载预测记录以显示更新后的结果
+      await _loadPredictions();
+    } catch (e) {
+      print('更新开奖结果失败: $e');
+    }
   }
 
   Future<void> _loadPredictions() async {
@@ -94,6 +139,127 @@ class _PredictionPageState extends State<PredictionPage> {
         _isLoading = false;
       });
     }
+  }
+
+  Future<void> _refreshData() async {
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      // 使用DataInitializer获取最新数据
+      await _dataInitializer.initializeData(
+        onProgress: (status) {
+          print('更新数据: $status');
+        },
+      );
+
+      // 更新最新开奖信息
+      await _loadLatestDraw();
+
+      // 更新开奖结果并重新加载预测
+      await _checkAndUpdateDrawnNumbers();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('数据更新成功')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('更新数据失败: $e')),
+      );
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _loadLatestDraw() async {
+    try {
+      final latestDraw = await _databaseService.getLatestDraw();
+      if (latestDraw != null) {
+        setState(() {
+          _latestDrawNumber = latestDraw.drawNumber;
+          _latestDrawNumbers = latestDraw.numbers;
+          _latestDrawDate = latestDraw.drawDate;
+        });
+      }
+    } catch (e) {
+      print('加载最新开奖信息失败: $e');
+    }
+  }
+
+  Widget _buildLatestDrawInfo() {
+    if (_latestDrawNumber == null ||
+        _latestDrawNumbers == null ||
+        _latestDrawDate == null) {
+      return const SizedBox.shrink();
+    }
+
+    final dateFormat = DateFormat('MM-dd');
+    final formattedDate = dateFormat.format(_latestDrawDate!);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.grey[100],
+        border: Border(
+          bottom: BorderSide(
+            color: Colors.grey[300]!,
+            width: 1,
+          ),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                '最新开奖: 第 $_latestDrawNumber 期',
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: Colors.grey,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                formattedDate,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: Colors.grey,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Wrap(
+            spacing: 4,
+            runSpacing: 4,
+            children: _latestDrawNumbers!
+                .map((number) => Container(
+                      width: 24,
+                      height: 24,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.blue[100],
+                      ),
+                      child: Center(
+                        child: Text(
+                          number.toString(),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.blue[900],
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ))
+                .toList(),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildPredictionNumber(int number, bool isHit) {
@@ -182,12 +348,13 @@ class _PredictionPageState extends State<PredictionPage> {
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: _isLoading ? null : _loadPredictions,
+            onPressed: _isLoading ? null : _refreshData,
           ),
         ],
       ),
       body: Column(
         children: [
+          _buildLatestDrawInfo(),
           Padding(
             padding: const EdgeInsets.all(16.0),
             child: ElevatedButton(
