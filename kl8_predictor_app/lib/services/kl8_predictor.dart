@@ -1,6 +1,8 @@
 import 'dart:math';
 import '../models/lottery_draw.dart';
 import 'database_service.dart';
+import 'dart:async';
+import 'dart:developer';
 
 class KL8Predictor {
   final DatabaseService _dbService;
@@ -20,13 +22,23 @@ class KL8Predictor {
       : _dbService = dbService ?? DatabaseService();
 
   Future<void> _ensureData() async {
-    // 如果数据未加载或者已经过期（超过1小时），重新加载
-    if (_allDraws.isEmpty ||
-        _lastUpdateTime == null ||
-        DateTime.now().difference(_lastUpdateTime!) > Duration(hours: 1)) {
-      _allDraws = await _dbService.getAllDraws();
-      _allDraws.sort((a, b) => b.drawDate.compareTo(a.drawDate)); // 按日期降序排序
-      _lastUpdateTime = DateTime.now();
+    try {
+      if (_allDraws.isEmpty ||
+          _lastUpdateTime == null ||
+          DateTime.now().difference(_lastUpdateTime!) > Duration(hours: 1)) {
+        print('开始加载历史数据...');
+        _allDraws = await _dbService.getAllDraws();
+        print('数据加载完成，共 ${_allDraws.length} 条记录');
+        _allDraws.sort((a, b) => b.drawDate.compareTo(a.drawDate)); // 按日期降序排序
+        _lastUpdateTime = DateTime.now();
+      }
+    } catch (e) {
+      print('数据加载错误: $e');
+      if (_allDraws.isEmpty) {
+        throw Exception('无法加载历史数据，且没有缓存数据可用');
+      }
+      // 如果有缓存数据，继续使用
+      print('使用缓存数据继续运行，共 ${_allDraws.length} 条记录');
     }
   }
 
@@ -304,22 +316,55 @@ class KL8Predictor {
   Future<List<List<int>>> predictNextNumbers({int groupCount = 5}) async {
     try {
       print('开始预测号码 predictNextNumbers - groupCount: $groupCount');
+      final stopwatch = Stopwatch()..start();
+      final timeoutDuration = Duration(seconds: 30);
+
+      print('步骤1/4: 确保数据已加载');
       await _ensureData();
       if (_allDraws.isEmpty) {
         print('历史数据为空，无法预测');
         return [];
       }
 
-      List<List<int>> predictions = [];
-      DateTime nextDrawDate = _allDraws.first.drawDate.add(Duration(days: 1));
+      print('步骤2/4: 开始数据分析');
+      // 异步并行处理分析计算
+      final analysisResults = await Future.wait([
+        Future(() {
+          print('分析全时段频率...');
+          return analyzeFrequency(weightRecent: true);
+        }),
+        Future(() {
+          print('分析近期频率...');
+          return analyzeFrequency(days: 30, weightRecent: false);
+        }),
+        Future(() {
+          print('分析历史同期数据...');
+          return analyzeHistoricalSamePeriod(
+              _allDraws.first.drawDate.add(Duration(days: 1)));
+        }),
+        Future(() {
+          print('分析和值范围...');
+          return analyzeSumRange(lookbackCount: 50);
+        }),
+        Future(() {
+          print('分析走势模式...');
+          return analyzeTrendPatterns();
+        }),
+        Future(() {
+          print('分析热门模式...');
+          return analyzeHotPatterns(lookbackCount: 100);
+        })
+      ]);
 
-      // 获取分析数据
-      var allTimeFreq = analyzeFrequency(weightRecent: true);
-      var recentFreq = analyzeFrequency(days: 30, weightRecent: false);
-      var historicalData = analyzeHistoricalSamePeriod(nextDrawDate);
-      var sumStats = analyzeSumRange(lookbackCount: 50);
-      var trendPatterns = analyzeTrendPatterns();
-      var hotPatterns = analyzeHotPatterns(lookbackCount: 100);
+      var allTimeFreq = analysisResults[0];
+      var recentFreq = analysisResults[1];
+      var historicalData = analysisResults[2];
+      var sumStats = analysisResults[3];
+      var trendPatterns = analysisResults[4];
+      var hotPatterns = analysisResults[5];
+
+      print('步骤3/4: 生成预测组合');
+      List<List<int>> predictions = [];
 
       // 计算号码得分
       Map<int, double> numberScores = {};
@@ -369,13 +414,14 @@ class KL8Predictor {
         numberScores[num] = score;
       }
 
-      // 生成预测组合
       int maxAttempts = 100;
       int currentAttempts = 0;
       double validationThreshold = 3.0;
       List<int> selectedNumbers = [];
 
-      while (predictions.length < groupCount && currentAttempts < maxAttempts) {
+      while (predictions.length < groupCount &&
+          currentAttempts < maxAttempts &&
+          stopwatch.elapsed < timeoutDuration) {
         currentAttempts++;
 
         // 使用轮盘赌选择法
@@ -415,13 +461,25 @@ class KL8Predictor {
 
         selectedNumbers.sort();
 
-        // 验证和值
+        // 首先验证和值
         int sum = selectedNumbers.reduce((a, b) => a + b);
         double mean = sumStats['mean']!;
         double std = sumStats['std']!;
 
         bool isValid = sum >= mean - validationThreshold * std &&
             sum <= mean + validationThreshold * std;
+
+        // 如果和值验证通过，进行完整验证
+        if (isValid) {
+          // 创建sumStats的副本，确保类型正确
+          Map<String, double> validationStats = {
+            'mean': sumStats['mean']!,
+            'std': sumStats['std']!,
+            'min': sumStats['min']!,
+            'max': sumStats['max']!
+          };
+          isValid = validateCombination(selectedNumbers, validationStats);
+        }
 
         if (isValid) {
           predictions.add(selectedNumbers);
@@ -432,15 +490,23 @@ class KL8Predictor {
           validationThreshold += 0.5;
           print('放宽验证条件，新的标准差阈值: $validationThreshold');
         }
+
+        // 如果运行时间过长，适当放宽条件
+        if (stopwatch.elapsed > Duration(seconds: 15) && predictions.isEmpty) {
+          validationThreshold += 0.5;
+          print('运行时间较长，放宽验证条件到: $validationThreshold');
+        }
       }
 
+      print('步骤4/4: 完成预测');
       // 如果没有生成足够的预测，使用最后一组号码
       if (predictions.isEmpty && currentAttempts >= maxAttempts) {
         print('达到最大尝试次数，使用最后一次生成的号码');
         predictions.add(selectedNumbers);
       }
 
-      print('预测生成完成，共生成 ${predictions.length} 组预测，总尝试次数: $currentAttempts');
+      print(
+          '预测生成完成，共生成 ${predictions.length} 组预测，总尝试次数: $currentAttempts，用时: ${stopwatch.elapsed.inSeconds}秒');
       return predictions;
     } catch (e, stackTrace) {
       print('预测过程中发生错误: $e');
@@ -482,19 +548,40 @@ class KL8Predictor {
   }
 
   Future<List<int>> generatePrediction() async {
-    print('开始生成单组预测');
     try {
-      print('调用 predictNextNumbers 生成预测');
-      final predictions = await predictNextNumbers(groupCount: 1);
-      if (predictions.isEmpty) {
-        print('未能生成有效预测组合');
-        throw Exception('无法生成有效的预测组合');
+      print('开始生成预测...');
+      await _ensureData();
+      if (_allDraws.isEmpty) {
+        throw Exception('无法获取历史开奖数据');
       }
-      print('成功生成预测: ${predictions.first}');
+
+      // 获取下一期日期
+      DateTime nextDrawDate = _allDraws.first.drawDate.add(Duration(days: 1));
+      print('开始分析历史同期数据');
+      var historicalData = analyzeHistoricalSamePeriod(nextDrawDate);
+      print('历史同期数据分析完成');
+
+      print('开始分析全量数据');
+      var allTimeFreq = analyzeFrequency(weightRecent: true);
+      print('全量数据分析完成');
+
+      print('开始分析近期数据');
+      var recentFreq = analyzeFrequency(days: 30, weightRecent: false);
+      var sumStats = analyzeSumRange(lookbackCount: 50);
+      var trendPatterns = analyzeTrendPatterns();
+      print('近期数据分析完成');
+
+      print('开始选号...');
+      var predictions = await predictNextNumbers(groupCount: 1);
+      if (predictions.isEmpty) {
+        throw Exception('无法生成预测号码');
+      }
+
+      print('预测号码生成完成: ${predictions.first}');
       return predictions.first;
     } catch (e) {
-      print('生成预测失败: ${e.toString()}');
-      throw Exception('生成预测失败: ${e.toString()}');
+      print('生成预测失败: $e');
+      rethrow;
     }
   }
 
